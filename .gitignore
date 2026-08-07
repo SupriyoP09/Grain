@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Runtime data — don't commit your actual DB files, WAL, or manifest
+data/*
+!data/.gitkeep
+
+# Test/benchmark scratch directories (created by exampletest.ts, benchmark.ts)
+examples/test-data/
+examples/bench-data/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Env files
+.env
+.env.local
+
+# OS/editor junk
+.DS_Store
+.vscode/
+*.swp
