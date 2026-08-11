@@ -4,7 +4,7 @@ export class Manifest {
     private files: string[] = [];
 
     constructor(private path: string) {
-        if (!fs.existsSync(path)) {
+        if (fs.existsSync(path)) {
             this.files = JSON.parse(fs.readFileSync(path, "utf-8"));
         }
     }
