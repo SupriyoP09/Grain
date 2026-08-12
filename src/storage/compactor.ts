@@ -8,6 +8,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Manifest } from '../manifest/manifest';
 import { flushToSSTable } from './sstable/writer';
+import { invalidateCache } from './sstable/reader';
 
 type Entry = {
   key: string;
@@ -42,6 +43,7 @@ export function compact(dataDir: string, manifest: Manifest): void {
 
     // delete the old files and their corresponding bloom filter files
     for (const file of files) {
+      invalidateCache(path.join(dataDir, file)); // invalidate the cache for the old files
       fs.unlinkSync(path.join(dataDir, file));
       const bloomFile = path.join(dataDir, file + '.bloom');
       if (fs.existsSync(bloomFile)) fs.unlinkSync(bloomFile);
