@@ -38,7 +38,7 @@ This project was built to understand, at the implementation level, how modern ke
 | Component | Description |
 |---|---|
 | MemTable | In-memory sorted write buffer backed by a `Map`, holding the most recent writes |
-| Write-Ahead Log (WAL) | Append-only, `fsync`-backed log written before every mutation, for durability |
+| Write-Ahead Log (WAL) | Append-only log written before every mutation, with `fsync` batched via group commit for durability at high write throughput |
 | SSTables | Immutable, sorted on-disk segment files produced when the MemTable is flushed |
 | Bloom Filter | Per-SSTable probabilistic filter that lets reads skip files that cannot contain a key |
 | Manifest | Tracks which SSTable files currently exist, newest first |
@@ -75,7 +75,7 @@ flowchart LR
     J --> K[Manifest.replaceFiles]
 ```
 
-Every write is appended to the WAL and `fsync`ed to disk before the in-memory MemTable is touched. This ordering is what makes crash recovery possible — if the process dies mid-write, the WAL is the durable source of truth.
+Every write is appended to the WAL before the in-memory MemTable is touched, so the file always contains a durable, ordered record of what happened. Rather than calling `fsync` after every single append, the WAL batches this via group commit: it tracks pending unsynced writes and forces a physical disk sync every 256 operations, or immediately whenever the WAL is cleared after a flush. This preserves the same ordering guarantee that makes crash recovery correct, while removing the per-write `fsync` cost that was capping write throughput — see [Benchmarks](#benchmarks).
 
 ---
 
@@ -201,22 +201,26 @@ All tests completed!
 npx tsx examples/benchmark.ts
 ```
 
-Benchmark: 10,000 writes followed by 10,000 random-key reads.
+Benchmark: 10,000 writes followed by 10,000 random-key reads, measured across three stages of the engine's development.
 
-| Metric | Before read cache | After read cache | Change |
-|---|---|---|---|
-| Writes | 601 writes/sec | 583 writes/sec | Unchanged (expected — see note below) |
-| Reads | 96 reads/sec | 126,875 reads/sec | ~1,322x faster |
+| Stage | Writes/sec | Reads/sec |
+|---|---|---|
+| Baseline | 601 | 96 |
+| + in-memory read cache | 583 | 126,875 |
+| + WAL group commit | 8,615 | 285,281 |
 
-**Why writes did not change:** every write calls `fsync` before acknowledging, which blocks until the operating system confirms the WAL entry is physically on disk. This is the cost of real durability, not an inefficiency — removing it would make writes faster but unsafe against crashes, so it was left untouched.
+**Why the read cache changed reads but not writes:** the original `readFromSSTable` re-read and re-parsed both the `.bloom` file and the full SSTable file from disk on every single call, even for files it had already read moments earlier. An in-memory cache (keyed by file path, invalidated on compaction) ensures each SSTable file and its Bloom filter are read from disk once, with all subsequent lookups served from memory — a ~1,322x improvement. Writes were untouched at this stage since the bottleneck there was unrelated to reads.
 
-**Why reads improved by three orders of magnitude:** the original `readFromSSTable` re-read and re-parsed both the `.bloom` file and the full SSTable file from disk on every single call, even for files it had already read moments earlier. An in-memory cache (keyed by file path, invalidated on compaction) now ensures each SSTable file and its Bloom filter are read from disk once, with all subsequent lookups served from memory.
+**Why group commit improved writes by roughly 14x:** every write originally called `fsync` individually, which blocks until the OS confirms the WAL entry is physically on disk — the real, unavoidable cost of per-write durability. Group commit batches this: `fsync` is called once every 256 pending writes (or immediately on flush), so most writes only pay the cost of a fast in-memory/OS-buffered append. Reads improved further in this stage too, largely due to less contention on the WAL file descriptor during the benchmark's write phase.
+
+**The durability tradeoff, stated plainly:** group commit does not weaken crash recovery against a process crash — Node's `fs.writeSync` hands data to the OS immediately, so a crashed process still leaves those writes in the WAL file for `WAL.replay` to recover. What it does trade away is protection against power loss or an OS-level crash within an unsynced batch: in the worst case, up to 255 writes that were acknowledged but not yet `fsync`ed could be lost if the machine loses power before the next batch boundary. This is a standard, well-understood tradeoff made by most production databases in exchange for write throughput, not an oversight.
 
 ---
 
 ## Design Decisions
 
-- **WAL before MemTable, always.** Every `set`/`delete` writes to the WAL and `fsync`s before touching the in-memory store, guaranteeing no acknowledged write can be lost to a crash.
+- **WAL before MemTable, always.** Every `set`/`delete` writes to the WAL before touching the in-memory store, so the log always reflects operations in the order they happened.
+- **Group commit over per-write fsync.** `fsync` is batched every 256 pending writes rather than called on every single one, trading a bounded window of power-loss durability for a roughly 14x improvement in write throughput — see [Benchmarks](#benchmarks) for the measured impact and the exact tradeoff.
 - **Tombstones over immediate deletion.** Deletes are recorded as `null` values rather than removed outright, so a delete correctly overrides an older value already flushed to an SSTable. Tombstones are only dropped permanently during compaction, once no older file can "resurrect" the key.
 - **JSON Lines on-disk format.** SSTables and the WAL use newline-delimited JSON rather than a binary format. This trades some space and parse efficiency for readability and simplicity, which was the right tradeoff for a project focused on the LSM-tree mechanics rather than serialization performance.
 - **Bloom filter per SSTable file.** Each flushed SSTable gets its own Bloom filter, avoiding a disk read entirely for files that cannot contain a given key.
@@ -226,7 +230,7 @@ Benchmark: 10,000 writes followed by 10,000 random-key reads.
 
 ## Known Limitations and Future Work
 
-- **No group commit.** Each write performs its own `fsync`, capping write throughput at roughly 600 writes/sec. Batching multiple writes into a single `fsync` (group commit) would improve this at the cost of added complexity.
+- **Fixed group commit interval.** The WAL syncs every 256 writes regardless of workload; this is not configurable, and there is no time-based fallback (e.g. "sync every 10ms even if fewer than 256 writes have queued"), which a production system would need to bound worst-case data loss under low write volume.
 - **No binary serialization.** SSTables and the WAL are stored as JSON Lines. A binary format with a fixed-size header, checksums, and a block index would reduce file size and parsing cost.
 - **No sparse index or binary search.** SSTable lookups scan a fully parsed in-memory map rather than using a sparse index over sorted, block-based data — sufficient at the scale this engine is tested at, but not how production LSM engines handle very large files.
 - **No range queries.** Only exact-key `get`/`set`/`delete` are supported; no iteration over key ranges.
