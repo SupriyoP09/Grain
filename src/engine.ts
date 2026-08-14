@@ -67,6 +67,8 @@ export class Engine {
 
     // flush the memtable to disk and clear the WAL
     private flush(): void {
+        this.wal.sync(); // Ensure all pending operations are synced to disk before flushing
+
         const filename = `sstable-${Date.now()}.log`;
         flushToSSTable(this.memtable.entries(), path.join(this.dataDir, filename));
         this.manifest.addFile(filename);
